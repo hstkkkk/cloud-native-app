@@ -1,205 +1,155 @@
 pipeline {
-    agent any
+    agent none
     
+    // 环境变量管理
     environment {
-        // Docker registry configuration
-        DOCKER_REGISTRY = 'your-registry.com'
-        DOCKER_REPO = 'cloud-native-app'
-        IMAGE_TAG = "${BUILD_NUMBER}"
-        
-        // Kubernetes configuration
-        KUBECONFIG = credentials('kubeconfig')
-        
-        // Maven configuration
-        MAVEN_OPTS = '-Dmaven.repo.local=.m2/repository'
+        HARBOR_REGISTRY = '172.22.83.19:30003'
+        IMAGE_NAME = 'nju22/prometheus-test-demo'
+        GIT_REPO = 'https://gitee.com/juyuanmou/prometheus-test-demo.git'
+        NAMESPACE = 'nju22'
+        MONITOR_NAMESPACE = 'nju22'
+        HARBOR_USER = 'nju22'
     }
     
-    tools {
-        maven 'Maven-3.9.0'
-        jdk 'JDK-17'
+    parameters {
+        string(name: 'HARBOR_PASS', defaultValue: '', description: 'Harbor login password')
     }
     
     stages {
-        stage('Checkout') {
+        stage('Clone Code') {
+            agent {
+                label 'master'
+            }
             steps {
-                echo 'Checking out source code...'
-                checkout scm
-            }
-        }
-        
-        stage('Build and Test') {
-            steps {
-                echo 'Building and testing application...'
-                sh '''
-                    # Clean and compile
-                    mvn clean compile
-                    
-                    # Run unit tests
-                    mvn test
-                    
-                    # Package application
-                    mvn package -DskipTests
-                '''
-            }
-            post {
-                always {
-                    // Publish test results
-                    publishTestResults testResultsPattern: 'target/surefire-reports/*.xml'
-                    
-                    // Archive artifacts
-                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
-                }
-            }
-        }
-        
-        stage('Code Quality Analysis') {
-            parallel {
-                stage('SonarQube Analysis') {
-                    when {
-                        branch 'main'
-                    }
-                    steps {
-                        echo 'Running SonarQube analysis...'
-                        script {
-                            try {
-                                withSonarQubeEnv('SonarQube') {
-                                    sh 'mvn sonar:sonar'
-                                }
-                            } catch (Exception e) {
-                                echo "SonarQube analysis failed: ${e.getMessage()}"
-                            }
-                        }
-                    }
-                }
-                
-                stage('Security Scan') {
-                    steps {
-                        echo 'Running security scan...'
-                        sh '''
-                            # Run OWASP dependency check
-                            mvn org.owasp:dependency-check-maven:check || true
-                        '''
-                    }
-                }
-            }
-        }
-        
-        stage('Build Docker Image') {
-            steps {
-                echo 'Building Docker image...'
+                echo "1.Git Clone Code"
                 script {
-                    def dockerImage = docker.build("${DOCKER_REPO}:${IMAGE_TAG}")
-                    
-                    // Tag with latest for main branch
-                    if (env.BRANCH_NAME == 'main') {
-                        dockerImage.tag('latest')
+                    try {
+                        git url: "${env.GIT_REPO}"
+                    } catch (Exception e) {
+                        error "Git clone failed: ${e.getMessage()}"
                     }
-                    
-                    env.DOCKER_IMAGE = "${DOCKER_REPO}:${IMAGE_TAG}"
                 }
             }
         }
         
-        stage('Push Docker Image') {
-            when {
-                anyOf {
-                    branch 'main'
-                    branch 'develop'
-                }
+        stage('Image Build') {
+            agent {
+                label 'master'
             }
             steps {
-                echo 'Pushing Docker image to registry...'
+                echo "2.Image Build Stage (包含 Maven 构建)"
                 script {
-                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
-                        def dockerImage = docker.image("${DOCKER_REPO}:${IMAGE_TAG}")
-                        dockerImage.push()
-                        
-                        if (env.BRANCH_NAME == 'main') {
-                            dockerImage.push('latest')
-                        }
+                    try {
+                        // 使用 Dockerfile 多阶段构建，包含 Maven 构建和镜像构建
+                        sh "docker build --cache-from ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:latest -t ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:${BUILD_NUMBER} -t ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:latest ."
+                    } catch (Exception e) {
+                        error "Docker build failed: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        stage('Push') {
+            agent {
+                label 'master'
+            }
+            steps {
+                echo "3.Push Docker Image Stage"
+                script {
+                    try {
+                        sh "echo '${HARBOR_PASS}' | docker login --username=${HARBOR_USER} --password-stdin ${env.HARBOR_REGISTRY}"
+                        sh "docker push ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:${BUILD_NUMBER}"
+                        sh "docker push ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:latest"
+                    } catch (Exception e) {
+                        error "Docker push failed: ${e.getMessage()}"
                     }
                 }
             }
         }
         
         stage('Deploy to Kubernetes') {
-            when {
-                branch 'main'
+            agent {
+                label 'slave'
             }
             steps {
-                echo 'Deploying to Kubernetes...'
-                script {
-                    sh '''
-                        # Update deployment image
-                        kubectl set image deployment/cloud-native-app \
-                            cloud-native-app=${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG} \
-                            --namespace=default
+                container('jnlp-kubectl') {
+                    script {
+                        stage('Clone YAML') {
+                            echo "4. Git Clone YAML To Slave"
+                            try {
+                                // 使用 checkout scm 获取当前流水线的源代码
+                                checkout scm
+                            } catch (Exception e) {
+                                error "Git clone on slave failed: ${e.getMessage()}"
+                            }
+                        }
                         
-                        # Wait for rollout to complete
-                        kubectl rollout status deployment/cloud-native-app --namespace=default --timeout=300s
+                        stage('Config YAML') {
+                            echo "5. Change YAML File Stage"
+                            sh 'sed -i "s/{VERSION}/${BUILD_NUMBER}/g" ./jenkins/scripts/prometheus-test-demo.yaml'
+                            sh 'sed -i "s/{NAMESPACE}/${NAMESPACE}/g" ./jenkins/scripts/prometheus-test-demo.yaml'
+                            sh 'sed -i "s/{MONITOR_NAMESPACE}/${MONITOR_NAMESPACE}/g" ./jenkins/scripts/prometheus-test-serviceMonitor.yaml'
+                            sh 'sed -i "s/{NAMESPACE}/${NAMESPACE}/g" ./jenkins/scripts/prometheus-test-serviceMonitor.yaml'
+
+                            sh 'cat ./jenkins/scripts/prometheus-test-demo.yaml'
+                            sh 'cat ./jenkins/scripts/prometheus-test-serviceMonitor.yaml'
+                        }
                         
-                        # Verify deployment
-                        kubectl get pods -l app=cloud-native-app --namespace=default
-                    '''
-                }
-            }
-        }
-        
-        stage('Integration Tests') {
-            when {
-                branch 'main'
-            }
-            steps {
-                echo 'Running integration tests...'
-                script {
-                    sh '''
-                        # Wait for service to be ready
-                        kubectl wait --for=condition=ready pod -l app=cloud-native-app --namespace=default --timeout=120s
+                        stage('Deploy prometheus-test-demo') {
+                            echo "6. Deploy To K8s Stage"
+                            sh 'kubectl apply -f ./jenkins/scripts/prometheus-test-demo.yaml'
+                        }
                         
-                        # Get service endpoint
-                        SERVICE_IP=$(kubectl get service cloud-native-app-service --namespace=default -o jsonpath='{.spec.clusterIP}')
+                        stage('Deploy prometheus-test-demo ServiceMonitor') {
+                            echo "7. Deploy ServiceMonitor To K8s Stage"
+                            try {
+                                sh 'kubectl apply -f ./jenkins/scripts/prometheus-test-serviceMonitor.yaml'
+                            } catch (Exception e) {
+                                error "ServiceMonitor deployment failed: ${e.getMessage()}"
+                            }
+                        }
                         
-                        # Run integration tests
-                        curl -f http://$SERVICE_IP/api/health || exit 1
-                        curl -f http://$SERVICE_IP/api/hello || exit 1
-                        
-                        echo "Integration tests passed!"
-                    '''
+                        stage('Health Check') {
+                            echo "8. Health Check Stage"
+                            try {
+                                sh "kubectl wait --for=condition=ready pod -l app=prometheus-test-demo -n ${NAMESPACE} --timeout=300s"
+                                echo "Application is healthy and ready!"
+                            } catch (Exception e) {
+                                error "Health check failed: ${e.getMessage()}"
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     
+    // 通知机制和清理
     post {
-        always {
-            echo 'Cleaning up...'
-            sh '''
-                # Clean up local Docker images
-                docker image prune -f || true
-                
-                # Clean up workspace
-                mvn clean || true
-            '''
-        }
-        
         success {
-            echo 'Pipeline completed successfully!'
-            // Send success notification
-            slackSend(
-                channel: '#deployments',
-                color: 'good',
-                message: "✅ Build ${BUILD_NUMBER} succeeded for ${JOB_NAME}"
-            )
+            echo '🎉 Pipeline succeeded! Application deployed successfully.'
+            script {
+                echo "✅ Deployment Summary:"
+                echo "   - Image: ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:${BUILD_NUMBER}"
+                echo "   - Namespace: ${NAMESPACE}"
+                echo "   - Monitor Namespace: ${MONITOR_NAMESPACE}"
+            }
         }
-        
         failure {
-            echo 'Pipeline failed!'
-            // Send failure notification
-            slackSend(
-                channel: '#deployments',
-                color: 'danger',
-                message: "❌ Build ${BUILD_NUMBER} failed for ${JOB_NAME}"
-            )
+            echo '❌ Pipeline failed! Please check the logs for details.'
+        }
+        always {
+            echo '🔄 Pipeline execution completed.'
+            // 清理本地镜像以节省磁盘空间
+            script {
+                try {
+                    sh "docker rmi ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:${BUILD_NUMBER} || true"
+                    sh "docker rmi ${env.HARBOR_REGISTRY}/${env.IMAGE_NAME}:latest || true"
+                    sh "docker system prune -f || true"
+                } catch (Exception e) {
+                    echo "Image cleanup failed: ${e.getMessage()}"
+                }
+            }
         }
     }
 }
