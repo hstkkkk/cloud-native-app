@@ -13,8 +13,8 @@ public class RateLimiterConfig {
 
     @Bean
     public Bucket bucket() {
-        // 限制每秒最多10次请求
-        Bandwidth limit = Bandwidth.classic(10, Refill.intervally(10, Duration.ofSeconds(1)));
+        // 限制每秒最多100次请求
+        Bandwidth limit = Bandwidth.classic(100, Refill.intervally(100, Duration.ofSeconds(1)));
         return Bucket.builder()
                 .addLimit(limit)
                 .build();
