@@ -34,7 +34,7 @@ pipeline {
         
         stage('Image Build') {
             agent {
-                label 'master'
+                label 'main'
             }
             steps {
                 echo "2.Image Build Stage (包含 Maven 构建)"
@@ -51,7 +51,7 @@ pipeline {
 
         stage('Push') {
             agent {
-                label 'master'
+                label 'main'
             }
             steps {
                 echo "3.Push Docker Image Stage"
