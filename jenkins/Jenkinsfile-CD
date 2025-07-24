@@ -1,0 +1,226 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['staging', 'production'],
+            description: 'Target deployment environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to deploy'
+        )
+        booleanParam(
+            name: 'ENABLE_REDIS',
+            defaultValue: false,
+            description: 'Enable Redis for distributed rate limiting'
+        )
+    }
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        DOCKER_REPO = 'cloud-native-app'
+        KUBECONFIG = credentials('kubeconfig')
+        NAMESPACE = "${params.ENVIRONMENT}"
+    }
+    
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                echo "Deploying ${DOCKER_REPO}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+                script {
+                    if (!params.IMAGE_TAG) {
+                        error "IMAGE_TAG parameter is required"
+                    }
+                }
+            }
+        }
+        
+        stage('Prepare Kubernetes Manifests') {
+            steps {
+                echo 'Preparing Kubernetes manifests...'
+                script {
+                    sh '''
+                        # Create namespace if it doesn't exist
+                        kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                        
+                        # Substitute environment-specific values
+                        sed -i "s|cloud-native-app:0.0.1-SNAPSHOT|${DOCKER_REGISTRY}/${DOCKER_REPO}:${IMAGE_TAG}|g" k8s/deployment.yaml
+                        sed -i "s|namespace: default|namespace: ${NAMESPACE}|g" k8s/*.yaml
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy Redis') {
+            when {
+                expression { params.ENABLE_REDIS }
+            }
+            steps {
+                echo 'Deploying Redis for distributed rate limiting...'
+                sh '''
+                    kubectl apply -f k8s/redis.yaml --namespace=${NAMESPACE}
+                    kubectl wait --for=condition=available deployment/redis --namespace=${NAMESPACE} --timeout=120s
+                '''
+            }
+        }
+        
+        stage('Deploy Application') {
+            steps {
+                echo 'Deploying application to Kubernetes...'
+                script {
+                    sh '''
+                        # Apply deployment and service
+                        kubectl apply -f k8s/deployment.yaml --namespace=${NAMESPACE}
+                        
+                        # Wait for deployment to be ready
+                        kubectl rollout status deployment/cloud-native-app --namespace=${NAMESPACE} --timeout=300s
+                        
+                        # Verify pods are running
+                        kubectl get pods -l app=cloud-native-app --namespace=${NAMESPACE}
+                    '''
+                }
+            }
+        }
+        
+        stage('Configure Monitoring') {
+            steps {
+                echo 'Setting up monitoring...'
+                script {
+                    sh '''
+                        # Apply ServiceMonitor for Prometheus
+                        kubectl apply -f k8s/servicemonitor.yaml --namespace=${NAMESPACE}
+                        
+                        # Apply HPA if in production
+                        if [ "${ENVIRONMENT}" = "production" ]; then
+                            kubectl apply -f k8s/hpa.yaml --namespace=${NAMESPACE}
+                            echo "HPA configured for production environment"
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            steps {
+                echo 'Performing health checks...'
+                script {
+                    sh '''
+                        # Wait for pods to be ready
+                        kubectl wait --for=condition=ready pod -l app=cloud-native-app --namespace=${NAMESPACE} --timeout=120s
+                        
+                        # Get service details
+                        kubectl get service cloud-native-app-service --namespace=${NAMESPACE}
+                        
+                        # Port forward for testing (in background)
+                        kubectl port-forward service/cloud-native-app-service 8080:80 --namespace=${NAMESPACE} &
+                        PORT_FORWARD_PID=$!
+                        
+                        # Wait a moment for port forwarding to establish
+                        sleep 5
+                        
+                        # Test health endpoint
+                        for i in {1..5}; do
+                            if curl -f http://localhost:8080/api/health; then
+                                echo "Health check passed!"
+                                break
+                            else
+                                echo "Health check attempt $i failed, retrying..."
+                                sleep 10
+                            fi
+                        done
+                        
+                        # Test hello endpoint
+                        curl -f http://localhost:8080/api/hello
+                        
+                        # Clean up port forward
+                        kill $PORT_FORWARD_PID || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Load Test') {
+            when {
+                expression { params.ENVIRONMENT == 'staging' }
+            }
+            steps {
+                echo 'Running load tests...'
+                script {
+                    sh '''
+                        # Port forward for load testing
+                        kubectl port-forward service/cloud-native-app-service 8080:80 --namespace=${NAMESPACE} &
+                        PORT_FORWARD_PID=$!
+                        sleep 5
+                        
+                        # Install apache bench if not available
+                        which ab || (apt-get update && apt-get install -y apache2-utils)
+                        
+                        # Run load test - 1000 requests with concurrency of 10
+                        ab -n 1000 -c 10 http://localhost:8080/api/hello
+                        
+                        # Test rate limiting - should get 429 responses
+                        echo "Testing rate limiting..."
+                        for i in {1..150}; do
+                            curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/api/hello
+                            echo ""
+                        done
+                        
+                        # Clean up
+                        kill $PORT_FORWARD_PID || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Update DNS/Ingress') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                echo 'Updating DNS/Ingress for production...'
+                // This would contain environment-specific ingress updates
+                script {
+                    sh '''
+                        echo "Production DNS/Ingress update would happen here"
+                        # kubectl apply -f k8s/ingress-prod.yaml --namespace=${NAMESPACE}
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo 'Deployment pipeline completed'
+            script {
+                sh '''
+                    # Get final deployment status
+                    kubectl get deployment cloud-native-app --namespace=${NAMESPACE} || true
+                    kubectl get pods -l app=cloud-native-app --namespace=${NAMESPACE} || true
+                    kubectl get services --namespace=${NAMESPACE} || true
+                '''
+            }
+        }
+        
+        success {
+            echo "✅ Successfully deployed ${DOCKER_REPO}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ Deployment ${BUILD_NUMBER} succeeded: ${DOCKER_REPO}:${params.IMAGE_TAG} → ${params.ENVIRONMENT}"
+            )
+        }
+        
+        failure {
+            echo "❌ Deployment failed for ${DOCKER_REPO}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ Deployment ${BUILD_NUMBER} failed: ${DOCKER_REPO}:${params.IMAGE_TAG} → ${params.ENVIRONMENT}"
+            )
+        }
+    }
+}
