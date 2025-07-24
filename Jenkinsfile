@@ -18,7 +18,7 @@ pipeline {
     stages {
         stage('Clone Code') {
             agent {
-                label 'master'
+                label 'main'
             }
             steps {
                 echo "1.Git Clone Code"
